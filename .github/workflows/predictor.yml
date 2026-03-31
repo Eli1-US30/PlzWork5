@@ -1,0 +1,99 @@
+name: Soccer Predictor
+
+on:
+  # Runs every Friday at 7:00am UTC (9:00am South Africa time)
+  schedule:
+    - cron: '0 7 * * 5'
+
+  # Manual trigger with a dropdown so you can run a test
+  # without waiting for Friday
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run mode'
+        required: true
+        default: 'predict'
+        type: choice
+        options:
+          - predict      # full prediction run
+          - test         # just sends a Telegram test message
+
+jobs:
+  run-predictor:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Check out your repository code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Step 2: Set up Java 17
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # Step 3: Cache Maven dependencies so it doesn't
+      # re-download every week (saves 30-60 seconds)
+      - name: Cache Maven packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      # Step 4: Restore persisted data files (ELO ratings + prediction CSV)
+      # These are stored as a GitHub Actions cache so they survive
+      # between weekly runs — without this ELO resets every Friday
+      - name: Restore data files
+        uses: actions/cache@v4
+        with:
+          path: data/
+          key: predictor-data-${{ github.run_id }}
+          restore-keys: predictor-data-
+
+      # Step 5: Build the project
+      - name: Build with Maven
+        run: mvn clean package -q -DskipTests
+
+      # Step 6: Run in test mode (only when manually triggered as test)
+      - name: Run test notification
+        if: ${{ github.event.inputs.mode == 'test' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FOOTBALL_DATA_KEY: ${{ secrets.FOOTBALL_DATA_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          java -cp target/classes:target/dependency/* org.example.files.TestRunner
+
+      # Step 7: Run full predictor (scheduled runs + manual predict runs)
+      - name: Run predictor
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.mode == 'predict' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FOOTBALL_DATA_KEY: ${{ secrets.FOOTBALL_DATA_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          java -cp target/classes:target/dependency/* org.example.files.Main
+
+      # Step 8: Save updated data files back to cache
+      # ELO ratings and prediction CSV persist to next week's run
+      - name: Save data files
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: data/
+          key: predictor-data-${{ github.run_id }}
+
+      # Step 9: Upload data files as an artifact so you can
+      # download and open predictions.csv from the Actions tab
+      - name: Upload predictions CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: predictions-${{ github.run_number }}
+          path: data/
+          retention-days: 90
