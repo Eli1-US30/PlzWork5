@@ -1,0 +1,80 @@
+name: Soccer Predictor
+
+on:
+  schedule:
+    - cron: '0 7 * * 5'
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run mode'
+        required: true
+        default: 'predict'
+        type: choice
+        options:
+          - predict
+          - test
+
+jobs:
+  run-predictor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Cache Maven packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Restore data files
+        uses: actions/cache@v4
+        with:
+          path: data/
+          key: predictor-data-${{ github.run_id }}
+          restore-keys: predictor-data-
+
+      - name: Build with Maven
+        run: mvn clean package -DskipTests
+
+      - name: Run test notification
+        if: ${{ github.event.inputs.mode == 'test' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FOOTBALL_DATA_KEY: ${{ secrets.FOOTBALL_DATA_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: java -cp target/PlzWork5-1.0-SNAPSHOT-jar-with-dependencies.jar org.example.files.TestRunner
+
+      - name: Run predictor
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.mode == 'predict' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FOOTBALL_DATA_KEY: ${{ secrets.FOOTBALL_DATA_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: java -cp target/PlzWork5-1.0-SNAPSHOT-jar-with-dependencies.jar org.example.files.Main
+
+      - name: Save data files
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: data/
+          key: predictor-data-${{ github.run_id }}
+
+      - name: Upload predictions CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: predictions-${{ github.run_number }}
+          path: data/
+          retention-days: 90
