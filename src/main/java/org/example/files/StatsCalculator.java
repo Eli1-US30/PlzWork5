@@ -18,6 +18,12 @@ import org.json.JSONObject;
  *   Blend: 50% match data + 30% FPL xG + 20% FPL strength rating
  *   (strength rating gets less weight as season progresses and
  *   we have more real match data)
+ *
+ * v5 change — ELO BLEND UPDATED TO 35/65:
+ *   historicElo * 0.35 + currentElo * 0.65
+ *   Live standings now drive 65% of base ELO so that current
+ *   season performance (e.g. Arsenal 1st, Wolves 20th) has
+ *   a stronger pull than historical pedigree.
  */
 public class StatsCalculator {
 
@@ -25,6 +31,10 @@ public class StatsCalculator {
     private static final double OPPONENT_WEIGHT_SCALE  = 0.3;
     private static final double MAX_FORM_NUDGE         = 30.0;
     private static final int    MIN_SPLIT_MATCHES      = 2;
+
+    // ELO blend weights — historic vs live standings
+    private static final double HISTORIC_WEIGHT  = 0.35;
+    private static final double CURRENT_WEIGHT   = 0.65;
 
     // FPL strength scale: 1000 = weakest, 1350 = strongest
     // Normalise to goals-per-game equivalent (0.5 to 2.5 range)
@@ -42,7 +52,14 @@ public class StatsCalculator {
         double standingsAdj = StandingsClient.getStandingsEloAdjustment(teamName);
         double historicElo  = seedElo + histBonus;
         double currentElo   = seedElo + standingsAdj;
-        double baseElo      = historicElo * 0.5 + currentElo * 0.5;
+
+        // 35% historic pedigree + 65% live standings — more reactive to current season
+        double baseElo      = historicElo * HISTORIC_WEIGHT + currentElo * CURRENT_WEIGHT;
+
+        System.out.printf("[ELO-BASE] %s  seed=%.0f  histBonus=%.0f  standingsAdj=%.0f  " +
+                        "historic=%.0f  current=%.0f  base=%.0f%n",
+                teamName, seedElo, histBonus, standingsAdj,
+                historicElo, currentElo, baseElo);
 
         // --- Last 5 matches ---
         JSONArray lastMatches = APIFootballClient.getLastMatches(teamId);
@@ -132,7 +149,6 @@ public class StatsCalculator {
         if (hCount >= MIN_SPLIT_MATCHES) {
             double rawHomeAtt = hGoalsFor / hTotal;
             double rawHomeDef = hGoalsAgainst / hTotal;
-            // Blend: 50% match data + 30% xG + 20% FPL strength
             double homeAtt = blendThree(rawHomeAtt, xgPerGame,  fplAttHome,  xgPerGame > 0);
             double homeDef = blendThree(rawHomeDef, xgcPerGame, fplDefHome, xgcPerGame > 0);
             team.setHomeAttack(Math.max(homeAtt, 0.3));
@@ -205,9 +221,4 @@ public class StatsCalculator {
         return GOALS_MIN + ((clamped - FPL_STR_MIN) / (FPL_STR_MAX - FPL_STR_MIN))
                 * (GOALS_MAX - GOALS_MIN);
     }
-
-    private static final double FPL_STR_MIN = 1000.0;
-    private static final double FPL_STR_MAX = 1350.0;
-    private static final double GOALS_MIN   = 0.5;
-    private static final double GOALS_MAX   = 2.5;
 }
