@@ -2,43 +2,60 @@ package org.example.files;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.HashMap;
 import java.util.Map;
 
+/**
+ * Builds team stats from FPL bootstrap and player history.
+ * Updated for 2025/26 PL season:
+ *   IN:  Leeds United, Burnley, Sunderland
+ *   OUT: Leicester City, Ipswich Town, Southampton
+ */
 public class FPLDataCache {
 
-    private static final Map<Integer, Integer> teamMatchesPlayed = new HashMap<>();
-    private static final Map<Integer, String>  fplTeamNames      = new HashMap<>();
-    private static final Map<String, Integer>  nameToFplId       = new HashMap<>();
-    private static final Map<Integer, Double>  teamXG            = new HashMap<>();
+    private static final Map<Integer, Integer> teamMatchesPlayed  = new HashMap<>();
+    private static final Map<Integer, String>  fplTeamNames       = new HashMap<>();
+    private static final Map<String, Integer>  nameToFplId        = new HashMap<>();
+    private static final Map<Integer, Double>  teamXG             = new HashMap<>();
+    private static final Map<Integer, Double>  teamXGConceded     = new HashMap<>();
 
-    // Now stores the starting GK's xGC per game rather than a team sum
-    private static final Map<Integer, Double>  teamXGConceded    = new HashMap<>();
+    private static final Map<Integer, Integer> strengthAttackHome  = new HashMap<>();
+    private static final Map<Integer, Integer> strengthAttackAway  = new HashMap<>();
+    private static final Map<Integer, Integer> strengthDefenceHome = new HashMap<>();
+    private static final Map<Integer, Integer> strengthDefenceAway = new HashMap<>();
 
     private static boolean initialized = false;
+    private static final int RECENT_FIXTURES = 5;
 
+    // football-data.org name -> FPL short name
+    // Updated for 2025/26 season
     private static final Map<String, String> NAME_BRIDGE = new HashMap<>();
     static {
-        NAME_BRIDGE.put("Manchester City FC",           "Man City");
         NAME_BRIDGE.put("Arsenal FC",                   "Arsenal");
+        NAME_BRIDGE.put("Manchester City FC",           "Man City");
         NAME_BRIDGE.put("Liverpool FC",                 "Liverpool");
         NAME_BRIDGE.put("Chelsea FC",                   "Chelsea");
-        NAME_BRIDGE.put("Manchester United FC",         "Man Utd");
-        NAME_BRIDGE.put("Tottenham Hotspur FC",         "Spurs");
         NAME_BRIDGE.put("Newcastle United FC",          "Newcastle");
         NAME_BRIDGE.put("Aston Villa FC",               "Aston Villa");
+        NAME_BRIDGE.put("Nottingham Forest FC",         "Nott'm Forest");
         NAME_BRIDGE.put("Brighton & Hove Albion FC",    "Brighton");
-        NAME_BRIDGE.put("West Ham United FC",           "West Ham");
         NAME_BRIDGE.put("Brentford FC",                 "Brentford");
         NAME_BRIDGE.put("Fulham FC",                    "Fulham");
         NAME_BRIDGE.put("Crystal Palace FC",            "Crystal Palace");
-        NAME_BRIDGE.put("Wolverhampton Wanderers FC",   "Wolves");
         NAME_BRIDGE.put("Everton FC",                   "Everton");
-        NAME_BRIDGE.put("Nottingham Forest FC",         "Nott'm Forest");
+        NAME_BRIDGE.put("West Ham United FC",           "West Ham");
         NAME_BRIDGE.put("AFC Bournemouth",              "Bournemouth");
-        NAME_BRIDGE.put("Leicester City FC",            "Leicester");
-        NAME_BRIDGE.put("Ipswich Town FC",              "Ipswich");
-        NAME_BRIDGE.put("Southampton FC",               "Southampton");
+        NAME_BRIDGE.put("Wolverhampton Wanderers FC",   "Wolves");
+        NAME_BRIDGE.put("Manchester United FC",         "Man Utd");
+        NAME_BRIDGE.put("Tottenham Hotspur FC",         "Spurs");
+        // Promoted 2025/26
+        NAME_BRIDGE.put("Leeds United FC",              "Leeds");
+        NAME_BRIDGE.put("Burnley FC",                   "Burnley");
+        NAME_BRIDGE.put("Sunderland AFC",               "Sunderland");
     }
 
     public static void initialize() {
@@ -67,17 +84,27 @@ public class FPLDataCache {
         }
         System.out.println("[FPL] Current gameweek: " + currentGameweek);
 
-        // Step 2: build FPL team ID -> name map
+        // Step 2: build team maps and FPL strength ratings
         JSONArray teams = bootstrap.getJSONArray("teams");
         for (int i = 0; i < teams.length(); i++) {
             JSONObject team = teams.getJSONObject(i);
-            int id   = team.getInt("id");
+            int    id   = team.getInt("id");
             String name = team.getString("name");
             fplTeamNames.put(id, name);
             teamMatchesPlayed.put(id, Math.max(currentGameweek - 1, 1));
+
+            strengthAttackHome.put(id,  team.optInt("strength_attack_home",  1200));
+            strengthAttackAway.put(id,  team.optInt("strength_attack_away",  1200));
+            strengthDefenceHome.put(id, team.optInt("strength_defence_home", 1200));
+            strengthDefenceAway.put(id, team.optInt("strength_defence_away", 1200));
+
+            System.out.printf("[FPL-STR] %-20s attH=%d attA=%d defH=%d defA=%d%n",
+                    name,
+                    strengthAttackHome.get(id), strengthAttackAway.get(id),
+                    strengthDefenceHome.get(id), strengthDefenceAway.get(id));
         }
 
-        // Step 3: build football-data.org name -> FPL ID reverse map
+        // Step 3: name bridge
         for (Map.Entry<String, String> entry : NAME_BRIDGE.entrySet()) {
             String fdName  = entry.getKey();
             String fplName = entry.getValue();
@@ -89,123 +116,134 @@ public class FPLDataCache {
             }
         }
 
-        // Step 4: sum outfield xG (all available non-GK players)
-        // Step 5: find the most likely starting GK per team for xGC
-        //
-        // For GK xGC we no longer sum all available keepers.
-        // Instead we find the one with the most minutes among available GKs —
-        // that's almost certainly the current starter. If two keepers are close
-        // in minutes (within 10%) we blend them weighted by minutes.
-        //
-        // Interim storage: teamId -> list of {xgc_per_game, minutes, availability}
-        Map<Integer, Double> gkBestMinutes  = new HashMap<>(); // best GK minutes so far
-        Map<Integer, Double> gkBestXGCRate  = new HashMap<>(); // that GK's xGC per game
+        // Step 4: process players
+        boolean lineupsAvailable = FPLLineupClient.isLineupsLoaded();
+        System.out.println("[FPL] Using confirmed lineups: " + lineupsAvailable);
+
+        Map<Integer, Double> gkBestMinutes   = new HashMap<>();
+        Map<Integer, Double> gkBestXGCRate   = new HashMap<>();
         Map<Integer, Double> gkSecondMinutes = new HashMap<>();
         Map<Integer, Double> gkSecondXGCRate = new HashMap<>();
 
         JSONArray players = bootstrap.getJSONArray("elements");
         for (int i = 0; i < players.length(); i++) {
-            JSONObject player = players.getJSONObject(i);
+            JSONObject player  = players.getJSONObject(i);
+            int    teamId      = player.getInt("team");
+            int    playerId    = player.getInt("id");
+            String status      = player.getString("status");
+            int    chance      = player.optInt("chance_of_playing_next_round", 100);
+            int    elementType = player.getInt("element_type");
+            int    minutes     = player.optInt("minutes", 0);
 
-            int    teamId         = player.getInt("team");
-            String status         = player.getString("status");
-            int    chanceOfPlaying = player.optInt("chance_of_playing_next_round", 100);
-            int    elementType    = player.getInt("element_type"); // 1=GK
+            if (status.equals("i") || status.equals("s") || chance == 0) continue;
+            if (lineupsAvailable && !FPLLineupClient.isConfirmedStarter(playerId)) continue;
 
-            // Skip fully unavailable players
-            if (status.equals("i") || status.equals("s") || chanceOfPlaying == 0) continue;
-
-            double availability = chanceOfPlaying / 100.0;
-            int    minutes      = player.optInt("minutes", 0);
-
-            double xg  = 0;
-            double xgc = 0;
-            try {
-                xg  = Double.parseDouble(player.getString("expected_goals"));
-                xgc = Double.parseDouble(player.getString("expected_goals_conceded"));
-            } catch (Exception e) {
-                // no xG data for this player
-            }
-
-            int played = teamMatchesPlayed.getOrDefault(teamId, 1);
+            double availability = lineupsAvailable ? 1.0 : (chance / 100.0);
+            double xg  = getRecentXG(playerId);
+            double xgc = elementType == 1 ? getRecentXGC(playerId) : 0;
+            int played = Math.min(RECENT_FIXTURES,
+                    teamMatchesPlayed.getOrDefault(teamId, 1));
 
             if (elementType == 1) {
-                // --- Goalkeeper logic ---
-                // effective minutes = actual minutes * availability probability
                 double effectiveMinutes = minutes * availability;
                 double xgcPerGame = played > 0 ? xgc / played : 0;
-
                 double bestMins = gkBestMinutes.getOrDefault(teamId, -1.0);
 
                 if (effectiveMinutes > bestMins) {
-                    // This GK has more minutes — demote old best to second
                     if (bestMins >= 0) {
                         gkSecondMinutes.put(teamId, bestMins);
-                        gkSecondXGCRate.put(teamId, gkBestXGCRate.getOrDefault(teamId, 0.0));
+                        gkSecondXGCRate.put(teamId,
+                                gkBestXGCRate.getOrDefault(teamId, 0.0));
                     }
                     gkBestMinutes.put(teamId, effectiveMinutes);
                     gkBestXGCRate.put(teamId, xgcPerGame);
-                } else if (effectiveMinutes > gkSecondMinutes.getOrDefault(teamId, -1.0)) {
+                } else if (effectiveMinutes >
+                        gkSecondMinutes.getOrDefault(teamId, -1.0)) {
                     gkSecondMinutes.put(teamId, effectiveMinutes);
                     gkSecondXGCRate.put(teamId, xgcPerGame);
                 }
-
             } else {
-                // --- Outfield player: accumulate xG ---
                 teamXG.merge(teamId, xg * availability, Double::sum);
             }
         }
 
-        // Step 6: compute final GK xGC per team
-        // If the backup has played within 20% of the starter's minutes, blend them
-        // (catches mid-season GK switches like an injury 10 games ago)
+        // Step 5: finalise GK xGC
         for (Integer teamId : fplTeamNames.keySet()) {
             double bestMins   = gkBestMinutes.getOrDefault(teamId, 0.0);
             double bestRate   = gkBestXGCRate.getOrDefault(teamId, -1.0);
             double secondMins = gkSecondMinutes.getOrDefault(teamId, 0.0);
             double secondRate = gkSecondXGCRate.getOrDefault(teamId, -1.0);
 
-            if (bestRate < 0) {
-                // No available GK found — skip
-                continue;
-            }
+            if (bestRate < 0) continue;
 
             double finalXGC;
-            String gkNote;
-
             if (secondRate >= 0 && bestMins > 0 && (secondMins / bestMins) >= 0.8) {
-                // Two keepers with similar minutes — genuine competition or recent switch
-                // Blend proportionally by minutes
                 double total = bestMins + secondMins;
                 finalXGC = (bestRate * bestMins + secondRate * secondMins) / total;
-                gkNote = String.format("blended (%.0f/%.0f mins) → xGC/g=%.2f",
-                        bestMins, secondMins, finalXGC);
+                System.out.printf("[FPL-GK] %-20s blended → xGC/g=%.2f%n",
+                        fplTeamNames.get(teamId), finalXGC);
             } else {
-                // Clear starter
                 finalXGC = bestRate;
-                gkNote = String.format("starter (%.0f mins) → xGC/g=%.2f", bestMins, finalXGC);
+                System.out.printf("[FPL-GK] %-20s starter → xGC/g=%.2f%n",
+                        fplTeamNames.get(teamId), finalXGC);
             }
-
             teamXGConceded.put(teamId, finalXGC);
-
-            String teamName = fplTeamNames.getOrDefault(teamId, "ID=" + teamId);
-            System.out.printf("[FPL-GK] %-20s %s%n", teamName, gkNote);
         }
 
         System.out.println("[FPL] Cache built for " + fplTeamNames.size() + " teams");
         initialized = true;
     }
 
-    // --- Public accessors (unchanged interface) ---
+    private static double getRecentXG(int playerId) {
+        return fetchRecentStat(playerId, "expected_goals");
+    }
+
+    private static double getRecentXGC(int playerId) {
+        return fetchRecentStat(playerId, "expected_goals_conceded");
+    }
+
+    private static double fetchRecentStat(int playerId, String statKey) {
+        try {
+            URL url = new URL("https://fantasy.premierleague.com/api/element-summary/"
+                    + playerId + "/");
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0");
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(5000);
+
+            if (conn.getResponseCode() != 200) return 0;
+
+            BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(conn.getInputStream()));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) sb.append(line);
+            reader.close();
+
+            JSONArray history = new JSONObject(sb.toString()).getJSONArray("history");
+            double total = 0;
+            int    start = Math.max(0, history.length() - RECENT_FIXTURES);
+
+            for (int i = start; i < history.length(); i++) {
+                try {
+                    total += Double.parseDouble(
+                            history.getJSONObject(i).getString(statKey));
+                } catch (Exception ignored) {}
+            }
+            return total;
+
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    // --- Public accessors ---
 
     public static double getTeamXGPerGame(String fdTeamName) {
         Integer fplId = nameToFplId.get(fdTeamName);
-        if (fplId == null) {
-            System.out.println("[FPL] No FPL ID found for: " + fdTeamName);
-            return -1;
-        }
-        double xg     = teamXG.getOrDefault(fplId, -1.0);
-        int    played = teamMatchesPlayed.getOrDefault(fplId, 1);
+        if (fplId == null) { System.out.println("[FPL] No FPL ID for: " + fdTeamName); return -1; }
+        double xg    = teamXG.getOrDefault(fplId, -1.0);
+        int    played = Math.min(RECENT_FIXTURES, teamMatchesPlayed.getOrDefault(fplId, 1));
         if (xg < 0) return -1;
         return xg / played;
     }
@@ -213,16 +251,29 @@ public class FPLDataCache {
     public static double getTeamXGConcededPerGame(String fdTeamName) {
         Integer fplId = nameToFplId.get(fdTeamName);
         if (fplId == null) return -1;
-        // Already stored as per-game rate now
         return teamXGConceded.getOrDefault(fplId, -1.0);
     }
 
-    // Legacy methods kept so nothing else breaks
-    public static double getTeamXG(String fdTeamName) {
-        return getTeamXGPerGame(fdTeamName);
+    public static int getStrengthAttackHome(String fdTeamName) {
+        Integer fplId = nameToFplId.get(fdTeamName);
+        return fplId != null ? strengthAttackHome.getOrDefault(fplId, 1200) : 1200;
     }
 
-    public static double getTeamXGConceded(String fdTeamName) {
-        return getTeamXGConcededPerGame(fdTeamName);
+    public static int getStrengthAttackAway(String fdTeamName) {
+        Integer fplId = nameToFplId.get(fdTeamName);
+        return fplId != null ? strengthAttackAway.getOrDefault(fplId, 1200) : 1200;
     }
+
+    public static int getStrengthDefenceHome(String fdTeamName) {
+        Integer fplId = nameToFplId.get(fdTeamName);
+        return fplId != null ? strengthDefenceHome.getOrDefault(fplId, 1200) : 1200;
+    }
+
+    public static int getStrengthDefenceAway(String fdTeamName) {
+        Integer fplId = nameToFplId.get(fdTeamName);
+        return fplId != null ? strengthDefenceAway.getOrDefault(fplId, 1200) : 1200;
+    }
+
+    public static double getTeamXG(String n)         { return getTeamXGPerGame(n); }
+    public static double getTeamXGConceded(String n) { return getTeamXGConcededPerGame(n); }
 }
