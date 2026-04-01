@@ -31,6 +31,12 @@ public class FPLDataCache {
     private static boolean initialized = false;
     private static final int RECENT_FIXTURES = 5;
 
+    // Feature 3: key player injury weighting
+    // Stores % of team xG contributed by the top scorer
+    // If they are unavailable, we apply a penalty to team xG
+    private static final Map<Integer, Double> teamTopScorerXGShare = new HashMap<>();
+    private static final Map<Integer, Boolean> topScorerAvailable  = new HashMap<>();
+
     // football-data.org name -> FPL short name
     // Updated for 2025/26 season
     private static final Map<String, String> NAME_BRIDGE = new HashMap<>();
@@ -164,6 +170,16 @@ public class FPLDataCache {
                 }
             } else {
                 teamXG.merge(teamId, xg * availability, Double::sum);
+
+                // Feature 3: track top scorer per team for key player weighting
+                double weightedXG = xg * availability;
+                double currentTop = teamTopScorerXGShare.getOrDefault(teamId, 0.0);
+                if (weightedXG > currentTop) {
+                    teamTopScorerXGShare.put(teamId, weightedXG);
+                    // Available if chance > 0 and not injured/suspended
+                    topScorerAvailable.put(teamId,
+                            !status.equals("i") && !status.equals("s") && chance > 0);
+                }
             }
         }
 
@@ -275,5 +291,34 @@ public class FPLDataCache {
     }
 
     public static double getTeamXG(String n)         { return getTeamXGPerGame(n); }
+
+    /**
+     * Feature 3: Returns an xG multiplier accounting for top scorer availability.
+     * If the team's top scorer is injured/suspended AND they contribute
+     * more than 30% of team xG, applies a proportional penalty.
+     * Returns 1.0 (no penalty) if top scorer is available or data is missing.
+     */
+    public static double getKeyPlayerXGMultiplier(String fdTeamName) {
+        Integer fplId = nameToFplId.get(fdTeamName);
+        if (fplId == null) return 1.0;
+
+        Boolean available = topScorerAvailable.get(fplId);
+        if (available == null || available) return 1.0; // available — no penalty
+
+        double topScorerXG = teamTopScorerXGShare.getOrDefault(fplId, 0.0);
+        double totalXG     = teamXG.getOrDefault(fplId, 0.0);
+        if (totalXG <= 0) return 1.0;
+
+        double share = topScorerXG / totalXG;
+
+        // Only penalise if top scorer contributes >30% of team xG
+        if (share < 0.30) return 1.0;
+
+        // Penalty scales with their share — max 20% reduction
+        double penalty = Math.min(0.20, (share - 0.30) * 0.5);
+        System.out.printf("[KEY-PLAYER] %s top scorer unavailable — xG share=%.1f%% → penalty=%.1f%%%n",
+                fdTeamName, share * 100, penalty * 100);
+        return 1.0 - penalty;
+    }
     public static double getTeamXGConceded(String n) { return getTeamXGConcededPerGame(n); }
 }

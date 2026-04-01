@@ -1,13 +1,20 @@
 package org.example.files;
 
+import java.io.*;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
 
 public class Main {
 
+    private static final ZoneId  SA_ZONE            = ZoneId.of("Africa/Johannesburg");
+    private static final String  NO_GAMES_FILE       = "data/last_no_games_date.txt";
+    private static final String  GAMES_TODAY_FILE    = "data/last_games_today_date.txt";
+
     public static void main(String[] args) {
         System.out.println("==============================================");
-        System.out.println("         SOCCER PREDICTOR v2.7");
+        System.out.println("         SOCCER PREDICTOR v2.8");
         System.out.println("==============================================\n");
 
         // --------------------------------------------------------
@@ -21,27 +28,45 @@ public class Main {
         List<Integer> teamsSoon = FPLLineupClient.getTeamsPlayingSoon();
         boolean isPreMatchRun   = !teamsSoon.isEmpty();
 
-        // No games today at all — send short notification and exit
+        String todaySA = LocalDate.now(SA_ZONE).toString(); // e.g. "2026-04-05"
+
+        // --------------------------------------------------------
+        // No games today — send notification ONCE per day then exit
+        // --------------------------------------------------------
         if (!gamesToday) {
-            System.out.println("[INIT] No games today — sending notification and exiting");
-            TelegramNotifier.sendNoGamesToday();
+            System.out.println("[INIT] No games today");
+
+            if (!alreadySentToday(NO_GAMES_FILE, todaySA)) {
+                System.out.println("[INIT] First check today — sending no-games notification");
+                TelegramNotifier.sendNoGamesToday();
+                saveSentDate(NO_GAMES_FILE, todaySA);
+            } else {
+                System.out.println("[INIT] Already sent no-games notification today — skipping");
+            }
+
             System.out.println("==============================================");
             return;
         }
 
+        // --------------------------------------------------------
         // Games today but not in our 25-90 min window yet
-        // Send "games today" notification once per day (first run that finds games)
+        // Send "games today" notification ONCE per day then exit
+        // --------------------------------------------------------
         if (!isPreMatchRun) {
             System.out.println("[INIT] Games today but not in prediction window yet");
 
-            // Build a simple FPL ID -> name map for the games today message
-            // We use a lightweight version here before full cache loads
-            java.util.Map<Integer, String> fplIdToName = buildLightFplNameMap();
-            List<TelegramNotifier.UpcomingGame> todaysGames =
-                    FPLLineupClient.getTodaysGames(fplIdToName);
+            if (!alreadySentToday(GAMES_TODAY_FILE, todaySA)) {
+                System.out.println("[INIT] First check today — sending games today notification");
+                java.util.Map<Integer, String> fplIdToName = buildLightFplNameMap();
+                List<TelegramNotifier.UpcomingGame> todaysGames =
+                        FPLLineupClient.getTodaysGames(fplIdToName);
 
-            if (!todaysGames.isEmpty()) {
-                TelegramNotifier.sendGamesToday(todaysGames);
+                if (!todaysGames.isEmpty()) {
+                    TelegramNotifier.sendGamesToday(todaysGames);
+                    saveSentDate(GAMES_TODAY_FILE, todaySA);
+                }
+            } else {
+                System.out.println("[INIT] Already sent games today notification — skipping");
             }
 
             System.out.println("[INIT] Exiting — will predict when window opens");
@@ -49,12 +74,13 @@ public class Main {
             return;
         }
 
+        // --------------------------------------------------------
         // Pre-match window — full prediction run
+        // --------------------------------------------------------
         System.out.println("[INIT] Pre-match window — running full prediction");
 
         // --------------------------------------------------------
         // STEP 2: Load persisted ELO and reconcile results
-        // Result reconciliation also sends Telegram result messages
         // --------------------------------------------------------
         EloStore.load();
         PredictionLogger.init();
@@ -62,7 +88,6 @@ public class Main {
 
         // --------------------------------------------------------
         // STEP 3: Load confirmed lineups before FPLDataCache
-        // so the cache uses confirmed starters
         // --------------------------------------------------------
         JSONBootstrapHelper.loadCurrentGameweek();
 
@@ -128,7 +153,6 @@ public class Main {
                 System.out.println(finalPrediction);
                 System.out.printf("  Over 1.5 : %.1f%%  Over 2.5 : %.1f%%  Over 3.5 : %.1f%%%n",
                         blended.over15Prob, blended.over25Prob, blended.over35Prob);
-                System.out.println("  ✅ Confirmed lineups used");
                 System.out.println();
 
             } catch (Exception e) {
@@ -154,6 +178,41 @@ public class Main {
         System.out.println("==============================================");
         System.out.println("           Predictions complete");
         System.out.println("==============================================");
+    }
+
+    // --------------------------------------------------------
+    // Checks if we already sent a notification today.
+    // Reads the date stored in the given file and compares
+    // to today's SA date.
+    // --------------------------------------------------------
+    private static boolean alreadySentToday(String filePath, String todaySA) {
+        try {
+            File file = new File(filePath);
+            if (!file.exists()) return false;
+            try (BufferedReader r = new BufferedReader(new FileReader(file))) {
+                String lastDate = r.readLine();
+                return todaySA.equals(lastDate != null ? lastDate.trim() : "");
+            }
+        } catch (Exception e) {
+            System.out.println("[INIT] Could not read date file " + filePath
+                    + ": " + e.getMessage());
+            return false;
+        }
+    }
+
+    // --------------------------------------------------------
+    // Saves today's SA date to a file so we know we already sent.
+    // --------------------------------------------------------
+    private static void saveSentDate(String filePath, String todaySA) {
+        try {
+            new File("data").mkdirs();
+            try (FileWriter fw = new FileWriter(filePath)) {
+                fw.write(todaySA);
+            }
+        } catch (Exception e) {
+            System.out.println("[INIT] Could not save date file " + filePath
+                    + ": " + e.getMessage());
+        }
     }
 
     /**

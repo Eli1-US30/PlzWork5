@@ -1,8 +1,18 @@
 package org.example.files;
 
+/**
+ * Holds all stats for one team used in simulation.
+ *
+ * New in this version (feature 6):
+ * - homeAdvantage field — calculated from the team's own home/away
+ *   win rate split across their last N matches rather than using
+ *   the flat 0.15 constant for everyone.
+ *   Set by StatsCalculator, read by Simulator.
+ *   Falls back to the global constant if insufficient data.
+ */
 public class Team {
 
-    private final int id;
+    private final int    id;
     private final String name;
 
     // Combined stats (fallback if home/away splits have thin data)
@@ -12,10 +22,14 @@ public class Team {
     private double elo;
 
     // Home/away splits — set to -1 if insufficient data (triggers fallback)
-    private double homeAttack  = -1;
-    private double homeDefense = -1;
-    private double awayAttack  = -1;
-    private double awayDefense = -1;
+    private double homeAttack   = -1;
+    private double homeDefense  = -1;
+    private double awayAttack   = -1;
+    private double awayDefense  = -1;
+
+    // Feature 6 — per-team home advantage
+    // -1 means not enough data — Simulator uses global constant (0.15)
+    private double homeAdvantage = -1;
 
     public Team(int id, String name) {
         this.id      = id;
@@ -35,50 +49,49 @@ public class Team {
     public double getElo()     { return elo; }
 
     /**
-     * Returns home attack if we have enough home data, otherwise falls back
-     * to the combined attack rating. Simulator should always call this
-     * rather than getAttack() directly.
+     * Returns home attack if we have enough home data,
+     * otherwise falls back to combined attack rating.
      */
     public double getHomeAttack() {
         return homeAttack >= 0 ? homeAttack : attack;
     }
 
-    /**
-     * Returns home defense if we have enough home data, otherwise combined.
-     */
     public double getHomeDefense() {
         return homeDefense >= 0 ? homeDefense : defense;
     }
 
-    /**
-     * Returns away attack if we have enough away data, otherwise combined.
-     */
     public double getAwayAttack() {
         return awayAttack >= 0 ? awayAttack : attack;
     }
 
-    /**
-     * Returns away defense if we have enough away data, otherwise combined.
-     */
     public double getAwayDefense() {
         return awayDefense >= 0 ? awayDefense : defense;
     }
 
-    // --- Setters ---
-    public void setAttack(double attack)   { this.attack = attack; }
-    public void setDefense(double defense) { this.defense = defense; }
-    public void setForm(double form)       { this.form = form; }
-    public void setElo(double elo)         { this.elo = elo; }
+    /**
+     * Returns this team's calculated home advantage multiplier.
+     * Returns -1 if not enough data — Simulator will use global constant.
+     */
+    public double getHomeAdvantage() {
+        return homeAdvantage;
+    }
 
-    public void setHomeAttack(double v)  { this.homeAttack  = v; }
-    public void setHomeDefense(double v) { this.homeDefense = v; }
-    public void setAwayAttack(double v)  { this.awayAttack  = v; }
-    public void setAwayDefense(double v) { this.awayDefense = v; }
+    // --- Setters ---
+    public void setAttack(double attack)           { this.attack        = attack; }
+    public void setDefense(double defense)         { this.defense       = defense; }
+    public void setForm(double form)               { this.form          = form; }
+    public void setElo(double elo)                 { this.elo           = elo; }
+    public void setHomeAttack(double v)            { this.homeAttack    = v; }
+    public void setHomeDefense(double v)           { this.homeDefense   = v; }
+    public void setAwayAttack(double v)            { this.awayAttack    = v; }
+    public void setAwayDefense(double v)           { this.awayDefense   = v; }
+    public void setHomeAdvantage(double v)         { this.homeAdvantage = v; }
 
     @Override
     public String toString() {
         return String.format(
-                "%s [ELO=%.0f, Att=%.2f(H=%.2f/A=%.2f), Def=%.2f(H=%.2f/A=%.2f), Form=%.2f]",
+                "%s [ELO=%.0f, Att=%.2f(H=%.2f/A=%.2f), " +
+                        "Def=%.2f(H=%.2f/A=%.2f), Form=%.2f, HomeAdv=%.2f]",
                 name, elo,
                 attack,
                 homeAttack  >= 0 ? homeAttack  : attack,
@@ -86,6 +99,7 @@ public class Team {
                 defense,
                 homeDefense >= 0 ? homeDefense : defense,
                 awayDefense >= 0 ? awayDefense : defense,
-                form);
+                form,
+                homeAdvantage >= 0 ? homeAdvantage : 0.15);
     }
 }

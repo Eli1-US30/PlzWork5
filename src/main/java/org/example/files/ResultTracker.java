@@ -8,12 +8,19 @@ import java.util.*;
 
 /**
  * Reconciles predictions with actual results.
- * Now sends a Telegram message for each newly recorded result
- * showing predicted vs actual with correct/incorrect flag.
+ *
+ * New in this version:
+ * - Feature 5: per-team accuracy tracking in printSummary()
+ * - Feature 9: blowout detection (margin ≥ 3, wrong prediction) flagged
+ *              with 🌪️ in console and passed to TelegramNotifier.sendResult()
+ * - Monthly summary trigger: checks if this is the first run of a new month
+ *   and calls TelegramNotifier.sendMonthlyAccuracy() if so
  */
 public class ResultTracker {
 
-    private static final String FILE_PATH = "data/predictions.csv";
+    private static final String FILE_PATH     = "data/predictions.csv";
+    private static final String LAST_MONTH_FILE = "data/last_summary_month.txt";
+    private static final int    BLOWOUT_MARGIN  = 3;
 
     private static final String HEADER =
             "date,season,home,away," +
@@ -26,15 +33,20 @@ public class ResultTracker {
     public static void reconcile() {
         System.out.println("[RESULTS] Checking for unrecorded results...");
 
+        // Load referee stats so we can update them with new results
+        RefereeAnalyzer.load();
+
         List<String[]> rows = loadCSV();
         if (rows.isEmpty()) {
             System.out.println("[RESULTS] No predictions on file yet.");
+            checkMonthlyReport(rows);
             return;
         }
 
         JSONArray recentMatches = APIFootballClient.getRecentResults();
         if (recentMatches.isEmpty()) {
             System.out.println("[RESULTS] No recent results fetched.");
+            checkMonthlyReport(rows);
             return;
         }
 
@@ -57,11 +69,11 @@ public class ResultTracker {
             for (String[] row : rows) {
                 if (row.length < 15) continue;
 
-                String predHome   = row[2].replace("\"", "");
-                String predAway   = row[3].replace("\"", "");
-                String alreadySet = row[13].trim();
+                String predHome    = row[2].replace("\"", "");
+                String predAway    = row[3].replace("\"", "");
+                String alreadySet  = row[13].trim();
 
-                boolean namesMatch  = predHome.equalsIgnoreCase(homeName)
+                boolean namesMatch   = predHome.equalsIgnoreCase(homeName)
                         && predAway.equalsIgnoreCase(awayName);
                 boolean needsFilling = alreadySet.isEmpty();
 
@@ -69,32 +81,41 @@ public class ResultTracker {
                     row[13] = String.valueOf(actualHome);
                     if (row.length > 14) row[14] = String.valueOf(actualAway);
 
-                    // Determine if prediction was correct
                     String predictedOutcome = row[9].replace("\"", "").trim();
                     String actualOutcome    = getOutcome(homeName, awayName,
                             actualHome, actualAway);
                     boolean correct = predictedOutcome.equalsIgnoreCase(actualOutcome);
+                    boolean blowout = !correct
+                            && Math.abs(actualHome - actualAway) >= BLOWOUT_MARGIN;
 
                     // Update ELO
                     EloStore.recordResult(homeName, awayName, actualHome, actualAway);
 
+                    // Update referee stats (feature 2)
+                    String referee = RefereeAnalyzer.extractReferee(match);
+                    if (referee != null) {
+                        RefereeAnalyzer.recordMatch(referee, homeName, awayName,
+                                actualHome, actualAway);
+                    }
+
                     // Send Telegram result notification
                     try {
-                        int predHome_goals = Integer.parseInt(row[4].trim());
-                        int predAway_goals = Integer.parseInt(row[5].trim());
+                        int predHomeGoals = Integer.parseInt(row[4].trim());
+                        int predAwayGoals = Integer.parseInt(row[5].trim());
                         TelegramNotifier.sendResult(
                                 homeName, awayName,
                                 actualHome, actualAway,
                                 predictedOutcome,
-                                predHome_goals, predAway_goals);
+                                predHomeGoals, predAwayGoals);
                     } catch (Exception e) {
                         System.out.println("[RESULTS] Could not send Telegram result: "
                                 + e.getMessage());
                     }
 
-                    System.out.printf("[RESULTS] %s %d-%d %s (predicted: %s, %s)%n",
+                    String blowoutTag = blowout ? " 🌪️ BLOWOUT" : "";
+                    System.out.printf("[RESULTS] %s %d-%d %s (predicted: %s, %s%s)%n",
                             homeName, actualHome, actualAway, awayName,
-                            predictedOutcome, correct ? "✅" : "❌");
+                            predictedOutcome, correct ? "✅" : "❌", blowoutTag);
 
                     updated++;
                     break;
@@ -110,38 +131,126 @@ public class ResultTracker {
         }
 
         printSummary(rows);
+
+        // Check if monthly report should be sent (feature 9)
+        checkMonthlyReport(rows);
     }
 
+    /**
+     * Prints overall accuracy + per-team breakdown to console.
+     * Feature 5: teams with accuracy below 40% are flagged.
+     */
     public static void printSummary(List<String[]> rows) {
-        int total = 0, correct = 0, pending = 0;
+        int total = 0, correct = 0, blowouts = 0, pending = 0;
+
+        // teamName -> [correct, total]
+        Map<String, int[]> teamStats = new LinkedHashMap<>();
 
         for (String[] row : rows) {
             if (row.length < 3 || row[0].equals("date")) continue;
-            String actualHome = row.length > 13 ? row[13].trim() : "";
-            String actualAway = row.length > 14 ? row[14].trim() : "";
+            String actualHomeStr = row.length > 13 ? row[13].trim() : "";
+            String actualAwayStr = row.length > 14 ? row[14].trim() : "";
 
-            if (actualHome.isEmpty() || actualAway.isEmpty()) { pending++; continue; }
-            total++;
-
-            String predictedOutcome = row.length > 9
-                    ? row[9].replace("\"", "").trim() : "";
-            String home = row[2].replace("\"", "");
-            String away = row[3].replace("\"", "");
+            if (actualHomeStr.isEmpty() || actualAwayStr.isEmpty()) {
+                pending++;
+                continue;
+            }
 
             try {
-                int ah = Integer.parseInt(actualHome);
-                int aa = Integer.parseInt(actualAway);
-                if (predictedOutcome.equalsIgnoreCase(getOutcome(home, away, ah, aa)))
-                    correct++;
+                int ah = Integer.parseInt(actualHomeStr);
+                int aa = Integer.parseInt(actualAwayStr);
+                String home      = row[2].replace("\"", "").trim();
+                String away      = row[3].replace("\"", "").trim();
+                String predicted = row.length > 9
+                        ? row[9].replace("\"", "").trim() : "";
+
+                String actualOutcome = getOutcome(home, away, ah, aa);
+                boolean isCorrect = predicted.equalsIgnoreCase(actualOutcome);
+                boolean isBlowout = !isCorrect
+                        && Math.abs(ah - aa) >= BLOWOUT_MARGIN;
+
+                total++;
+                if (isCorrect) correct++;
+                if (isBlowout) blowouts++;
+
+                // Per-team tracking
+                for (String teamName : new String[]{home, away}) {
+                    teamStats.computeIfAbsent(teamName, k -> new int[]{0, 0});
+                    teamStats.get(teamName)[1]++;
+                    if (isCorrect) teamStats.get(teamName)[0]++;
+                }
+
             } catch (NumberFormatException ignored) {}
         }
 
         if (total > 0) {
-            System.out.printf("%n[ACCURACY] %d/%d correct (%.1f%%)  |  %d pending%n%n",
-                    correct, total, 100.0 * correct / total, pending);
+            double pct = 100.0 * correct / total;
+            System.out.printf("%n[ACCURACY] %d/%d correct (%.1f%%)  |  " +
+                            "%d blowouts  |  %d pending%n",
+                    correct, total, pct, blowouts, pending);
+
+            // Print per-team breakdown — flag those below threshold
+            System.out.println("[ACCURACY] Per-team breakdown:");
+            teamStats.entrySet().stream()
+                    .sorted((a, b) -> {
+                        double pctA = 100.0 * a.getValue()[0]
+                                / Math.max(a.getValue()[1], 1);
+                        double pctB = 100.0 * b.getValue()[0]
+                                / Math.max(b.getValue()[1], 1);
+                        return Double.compare(pctB, pctA); // descending
+                    })
+                    .forEach(e -> {
+                        double teamPct = 100.0 * e.getValue()[0]
+                                / Math.max(e.getValue()[1], 1);
+                        String flag = teamPct < 25.0  ? " 🚨"
+                                : teamPct < 40.0 ? " ⚠️"
+                                : "";
+                        System.out.printf("  %-35s %d/%d  %.1f%%%s%n",
+                                e.getKey(),
+                                e.getValue()[0], e.getValue()[1],
+                                teamPct, flag);
+                    });
+            System.out.println();
         } else {
             System.out.printf("[ACCURACY] No completed predictions  |  %d pending%n%n",
                     pending);
+        }
+    }
+
+    /**
+     * Checks if this is the first run of a new month.
+     * If so, sends the monthly accuracy summary to Telegram.
+     * Stores the last sent month in data/last_summary_month.txt
+     */
+    private static void checkMonthlyReport(List<String[]> rows) {
+        try {
+            String currentMonth = java.time.ZonedDateTime
+                    .now(java.time.ZoneId.of("Africa/Johannesburg"))
+                    .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM"));
+
+            // Read last sent month
+            String lastMonth = "";
+            File lastMonthFile = new File(LAST_MONTH_FILE);
+            if (lastMonthFile.exists()) {
+                try (BufferedReader r = new BufferedReader(
+                        new FileReader(lastMonthFile))) {
+                    lastMonth = r.readLine().trim();
+                }
+            }
+
+            if (!currentMonth.equals(lastMonth)) {
+                System.out.println("[MONTHLY] New month detected — sending accuracy report");
+                TelegramNotifier.sendMonthlyAccuracy(rows);
+
+                // Save current month so we don't send again this month
+                new File("data").mkdirs();
+                try (FileWriter fw = new FileWriter(LAST_MONTH_FILE)) {
+                    fw.write(currentMonth);
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("[MONTHLY] Could not check monthly report: "
+                    + e.getMessage());
         }
     }
 
