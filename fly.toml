@@ -1,0 +1,19 @@
+# fly.toml — Fly.io configuration for Soccer Predictor
+# Auto-generated — do not edit app name
+
+app = 'plzwork5-predictor'
+primary_region = 'jnb'  # Johannesburg — closest to SA
+
+[build]
+
+[env]
+TZ = "Africa/Johannesburg"
+
+# No HTTP server needed — this is a background worker
+[processes]
+app = "java -jar /app/app.jar"
+
+[[vm]]
+memory = '256mb'
+cpu_kind = 'shared'
+cpus = 1

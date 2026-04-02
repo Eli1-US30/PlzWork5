@@ -293,6 +293,26 @@ public class FPLDataCache {
     public static double getTeamXG(String n)         { return getTeamXGPerGame(n); }
 
     /**
+     * Resets the cache so it can be reinitialised for the next match.
+     * Called by Main between matches so lineups are reloaded fresh.
+     */
+    public static void reset() {
+        initialized = false;
+        teamXG.clear();
+        teamXGConceded.clear();
+        teamMatchesPlayed.clear();
+        fplTeamNames.clear();
+        nameToFplId.clear();
+        strengthAttackHome.clear();
+        strengthAttackAway.clear();
+        strengthDefenceHome.clear();
+        strengthDefenceAway.clear();
+        teamTopScorerXGShare.clear();
+        topScorerAvailable.clear();
+        System.out.println("[FPL] Cache reset — will reload on next initialize()");
+    }
+
+    /**
      * Feature 3: Returns an xG multiplier accounting for top scorer availability.
      * If the team's top scorer is injured/suspended AND they contribute
      * more than 30% of team xG, applies a proportional penalty.
