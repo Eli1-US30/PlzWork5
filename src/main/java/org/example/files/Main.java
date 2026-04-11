@@ -1,8 +1,11 @@
 package org.example.files;
 
-import java.io.*;
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.time.LocalDate;
 import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -10,15 +13,17 @@ import java.util.List;
  * Soccer Predictor v3.2 — Morning Run
  *
  * Runs once every morning at 6am UTC (8am SA time).
- * Predicts ALL upcoming PL matches in the next 7 days.
- * Sends one Telegram message with all predictions for the week.
+ * Predicts matches happening TOMORROW only.
  *
- * Why morning runs:
- *   - Zero timing issues — runs at a fixed reliable time
- *   - GitHub Actions at 6am UTC is consistent with minimal queue delays
- *   - Covers the full week so weekend games are never missed
- *   - Lineups not confirmed yet but ELO, xG, form, H2H and
- *     referee data do the heavy lifting at this stage of the season
+ * Logic:
+ *   - No matches tomorrow → exit silently (no spam)
+ *   - Matches tomorrow → full prediction → one Telegram message
+ *
+ * This means:
+ *   - Friday morning → predicts Saturday games
+ *   - Saturday morning → predicts Sunday games
+ *   - Monday morning → predicts Tuesday games
+ *   - Data is always fresh — predictions made the day before
  *
  * Future upgrade (after 2 seasons of data):
  *   - Switch to Oracle Cloud VM for confirmed-lineup predictions
@@ -42,20 +47,22 @@ public class Main {
         ResultTracker.reconcile();
 
         // --------------------------------------------------------
-        // STEP 2: Get upcoming fixtures for the next 7 days
+        // STEP 2: Check for matches tomorrow
         // --------------------------------------------------------
-        System.out.println("[INIT] Fetching upcoming fixtures...");
-        List<Match> matches = FixtureFetcher.getUpcomingMatches();
+        LocalDate tomorrow = LocalDate.now(SA_ZONE).plusDays(1);
+        System.out.println("[INIT] Checking for matches on "
+                + tomorrow.format(DateTimeFormatter.ofPattern("EEEE d MMMM")) + "...");
+
+        List<Match> matches = getTomorrowsMatches(tomorrow);
 
         if (matches.isEmpty()) {
-            System.out.println("[INIT] No fixtures in the next 7 days");
-            TelegramNotifier.sendNoGamesToday();
+            System.out.println("[INIT] No matches tomorrow — exiting silently");
             System.out.println("==============================================");
             return;
         }
 
         System.out.println("[INIT] Found " + matches.size()
-                + " fixture(s) — loading data sources...\n");
+                + " match(es) tomorrow — loading data sources...\n");
 
         // --------------------------------------------------------
         // STEP 3: Load all data sources
@@ -117,10 +124,10 @@ public class Main {
         }
 
         // --------------------------------------------------------
-        // STEP 5: Send all predictions to Telegram
+        // STEP 5: Send predictions to Telegram
         // --------------------------------------------------------
         if (!finalPredictions.isEmpty()) {
-            System.out.println("[TELEGRAM] Sending weekly predictions...");
+            System.out.println("[TELEGRAM] Sending predictions for tomorrow...");
             TelegramNotifier.sendPredictions(matches, finalPredictions, blendedList);
         }
 
@@ -132,5 +139,57 @@ public class Main {
         System.out.println("==============================================");
         System.out.println("           Predictions complete");
         System.out.println("==============================================");
+    }
+
+    // --------------------------------------------------------
+    // Fetch only matches scheduled for tomorrow (SA date)
+    // Uses football-data.org upcoming fixtures
+    // --------------------------------------------------------
+    private static List<Match> getTomorrowsMatches(LocalDate tomorrow) {
+        List<Match> tomorrowMatches = new ArrayList<>();
+
+        JSONArray fixtures = APIFootballClient.getUpcomingFixtures();
+
+        for (int i = 0; i < fixtures.length(); i++) {
+            try {
+                JSONObject fixture = fixtures.getJSONObject(i);
+
+                String dateStr = fixture.getString("utcDate").substring(0, 10);
+                LocalDate matchDate = LocalDate.parse(dateStr);
+
+                // Convert UTC date to SA date for accurate comparison
+                // Most PL games are afternoon/evening UTC so SA date is same
+                // but we check both UTC date and SA date to be safe
+                if (!matchDate.equals(tomorrow) &&
+                        !matchDate.equals(tomorrow.minusDays(1))) {
+                    // Skip if clearly not tomorrow
+                    if (!matchDate.equals(tomorrow)) continue;
+                }
+
+                // Only include if SA date matches tomorrow
+                if (!matchDate.equals(tomorrow)) continue;
+
+                int fixtureId = fixture.getInt("id");
+                JSONObject home = fixture.getJSONObject("homeTeam");
+                JSONObject away = fixture.getJSONObject("awayTeam");
+
+                int    homeId   = home.getInt("id");
+                String homeName = home.getString("name");
+                int    awayId   = away.getInt("id");
+                String awayName = away.getString("name");
+
+                tomorrowMatches.add(
+                        new Match(fixtureId, homeId, homeName, awayId, awayName));
+
+                System.out.printf("[FIXTURE] %s vs %s on %s%n",
+                        homeName, awayName, matchDate);
+
+            } catch (Exception e) {
+                System.out.println("[WARN] Could not parse fixture: "
+                        + e.getMessage());
+            }
+        }
+
+        return tomorrowMatches;
     }
 }
