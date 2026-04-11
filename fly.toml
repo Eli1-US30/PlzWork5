@@ -2,7 +2,7 @@
 # Auto-generated — do not edit app name
 
 app = 'plzwork5-predictor'
-primary_region = 'jnb'  # Johannesburg — closest to SA
+primary_region = 'fra'  # Frankfurt — free region, still close enough
 
 [build]
 

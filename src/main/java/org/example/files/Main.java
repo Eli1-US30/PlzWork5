@@ -1,185 +1,123 @@
 package org.example.files;
 
-import org.json.JSONArray;
-import org.json.JSONObject;
-
 import java.io.*;
-import java.time.*;
-import java.time.format.DateTimeFormatter;
-import java.util.*;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
- * Main entry point for Fly.io deployment.
+ * Main entry point for GitHub Actions deployment.
  *
- * Runs as a continuous loop — never exits.
- * Each day:
- *   1. Wakes up at 8am SA time
- *   2. Fetches today's PL kickoff times from FPL
- *   3. No games → sends "no games" notification → sleeps until tomorrow 8am
- *   4. Games today → sends "games today" notification
- *   5. For each match: sleeps until 75 min before kickoff
- *                      grabs lineups → full prediction → sends Telegram
- *   6. After last match → sleeps until tomorrow 8am
+ * Runs once per trigger and exits — GitHub Actions handles scheduling.
+ * Cron: every 30 minutes, 7am-9pm UTC (9am-11pm SA time)
  *
- * GitHub Actions (predictor.yml) kept as backup — runs weekly on Fridays.
+ * Each run:
+ *   1. Check FPL fixtures — one free API call
+ *   2. No games today → send notification ONCE per day → exit
+ *   3. Games today but not in window → send games list ONCE per day → exit
+ *   4. Match in 25-120 min window → full prediction run
+ *
+ * Window widened from 90 to 120 minutes to handle GitHub Actions delays.
  */
 public class Main {
 
-    private static final ZoneId SA_ZONE           = ZoneId.of("Africa/Johannesburg");
-    private static final int    WAKE_HOUR          = 8;   // 8am SA time daily wakeup
-    private static final int    PRE_MATCH_MINUTES  = 75;  // predict 75 min before kickoff
+    private static final ZoneId SA_ZONE          = ZoneId.of("Africa/Johannesburg");
+    private static final String NO_GAMES_FILE    = "data/last_no_games_date.txt";
+    private static final String GAMES_TODAY_FILE = "data/last_games_today_date.txt";
+
+    // Widened window — 25-120 min handles GitHub delays up to 90 min
+    private static final int    WINDOW_MIN       = 25;
+    private static final int    WINDOW_MAX       = 120;
 
     public static void main(String[] args) {
         System.out.println("==============================================");
-        System.out.println("      SOCCER PREDICTOR v3.0 — Fly.io");
-        System.out.println("==============================================");
-        System.out.println("Running as continuous loop — never exits");
-        System.out.println("Wakes up at " + WAKE_HOUR + "am SA time each day");
+        System.out.println("         SOCCER PREDICTOR v3.1");
         System.out.println("==============================================\n");
 
-        // Load persistent data once at startup
-        EloStore.load();
-        RefereeAnalyzer.load();
+        System.out.println("[INIT] Checking FPL fixtures...");
 
-        // Main loop — runs forever
-        while (true) {
-            try {
-                runDailyCheck();
-            } catch (Exception e) {
-                System.out.println("[MAIN] Unexpected error: " + e.getMessage());
-                e.printStackTrace();
+        boolean gamesToday      = FPLLineupClient.hasGamesToday();
+        List<Integer> teamsSoon = getTeamsInWindow();
+        boolean isPreMatchRun   = !teamsSoon.isEmpty();
+
+        String todaySA = LocalDate.now(SA_ZONE).toString();
+
+        // --------------------------------------------------------
+        // No games today — send once per day then exit
+        // --------------------------------------------------------
+        if (!gamesToday) {
+            System.out.println("[INIT] No games today");
+            if (!alreadySentToday(NO_GAMES_FILE, todaySA)) {
+                TelegramNotifier.sendNoGamesToday();
+                saveSentDate(NO_GAMES_FILE, todaySA);
+                System.out.println("[INIT] Sent no-games notification");
+            } else {
+                System.out.println("[INIT] Already sent no-games today — skipping");
             }
-            sleepUntilTomorrow();
+            System.out.println("==============================================");
+            return;
         }
-    }
 
-    // --------------------------------------------------------
-    // Daily check — runs once per day at 8am SA time
-    // --------------------------------------------------------
-    private static void runDailyCheck() {
-        ZonedDateTime now = ZonedDateTime.now(SA_ZONE);
-        System.out.println("\n[DAILY] Starting daily check — "
-                + now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm z")));
+        // --------------------------------------------------------
+        // Games today but not in window — send once per day then exit
+        // --------------------------------------------------------
+        if (!isPreMatchRun) {
+            System.out.println("[INIT] Games today but not in prediction window");
+            if (!alreadySentToday(GAMES_TODAY_FILE, todaySA)) {
+                java.util.Map<Integer, String> fplIdToName = buildLightFplNameMap();
+                List<TelegramNotifier.UpcomingGame> todaysGames =
+                        FPLLineupClient.getTodaysGames(fplIdToName);
+                if (!todaysGames.isEmpty()) {
+                    TelegramNotifier.sendGamesToday(todaysGames);
+                    saveSentDate(GAMES_TODAY_FILE, todaySA);
+                    System.out.println("[INIT] Sent games today notification");
+                }
+            } else {
+                System.out.println("[INIT] Already sent games today — skipping");
+            }
+            System.out.println("[INIT] Exiting — will predict when window opens");
+            System.out.println("==============================================");
+            return;
+        }
 
-        // Reconcile any results from yesterday
+        // --------------------------------------------------------
+        // Pre-match window — full prediction run
+        // --------------------------------------------------------
+        System.out.println("[INIT] Pre-match window — running full prediction");
+
+        EloStore.load();
         PredictionLogger.init();
         ResultTracker.reconcile();
+        RefereeAnalyzer.load();
 
-        // Check FPL for today's games
-        boolean gamesToday = FPLLineupClient.hasGamesToday();
+        JSONBootstrapHelper.loadCurrentGameweek();
 
-        if (!gamesToday) {
-            System.out.println("[DAILY] No games today");
-            TelegramNotifier.sendNoGamesToday();
+        FPLDataCache.initialize();
+        TheSportsDBClient.preload();
+        StandingsClient.preload();
+        OddsClient.preload();
+
+        List<Match> matches = FixtureFetcher.getMatchesForTeams(teamsSoon);
+
+        if (matches.isEmpty()) {
+            System.out.println("[INIT] No matches found for prediction window");
+            System.out.println("==============================================");
             return;
         }
 
-        // Build name map
-        Map<Integer, String> fplIdToName = buildLightFplNameMap();
+        System.out.println("\nPredicting " + matches.size() + " match(es)\n");
 
-        // Send games today notification
-        List<TelegramNotifier.UpcomingGame> todaysGames =
-                FPLLineupClient.getTodaysGames(fplIdToName);
-        if (!todaysGames.isEmpty()) {
-            TelegramNotifier.sendGamesToday(todaysGames);
-            System.out.println("[DAILY] Sent games today — "
-                    + todaysGames.size() + " match(es)");
-        }
+        List<Prediction> finalPredictions = new ArrayList<>();
+        List<OddsBlender.BlendedProbabilities> blendedList = new ArrayList<>();
 
-        // Parse kickoff times
-        JSONArray allFixtures = FPLLineupClient.getAllFixtures();
-        List<ScheduledMatch> todayMatches =
-                getTodayMatchesWithKickoffs(allFixtures, fplIdToName);
+        for (Match match : matches) {
+            System.out.println("==============================================");
+            System.out.println("  " + match.getHomeTeamName()
+                    + " vs " + match.getAwayTeamName());
+            System.out.println("==============================================");
 
-        if (todayMatches.isEmpty()) {
-            System.out.println("[DAILY] Could not parse kickoff times");
-            return;
-        }
-
-        // Sort by kickoff
-        todayMatches.sort(Comparator.comparing(m -> m.kickoffUTC));
-
-        System.out.println("[DAILY] " + todayMatches.size() + " match(es) scheduled:");
-        for (ScheduledMatch m : todayMatches) {
-            ZonedDateTime kickoffSA = m.kickoffUTC.withZoneSameInstant(SA_ZONE);
-            ZonedDateTime predictAt = kickoffSA.minusMinutes(PRE_MATCH_MINUTES);
-            System.out.printf("  %s vs %s  kickoff=%s  predict=%s%n",
-                    m.homeTeam, m.awayTeam,
-                    kickoffSA.format(DateTimeFormatter.ofPattern("HH:mm")),
-                    predictAt.format(DateTimeFormatter.ofPattern("HH:mm")));
-        }
-
-        // Process each match in order
-        for (ScheduledMatch match : todayMatches) {
-            processMatch(match);
-        }
-
-        System.out.println("[DAILY] All matches processed");
-    }
-
-    // --------------------------------------------------------
-    // Sleep until prediction time then predict
-    // --------------------------------------------------------
-    private static void processMatch(ScheduledMatch match) {
-        ZonedDateTime now       = ZonedDateTime.now(SA_ZONE);
-        ZonedDateTime kickoffSA = match.kickoffUTC.withZoneSameInstant(SA_ZONE);
-        ZonedDateTime predictAt = kickoffSA.minusMinutes(PRE_MATCH_MINUTES);
-
-        System.out.printf("%n[MATCH] %s vs %s — kickoff %s SA%n",
-                match.homeTeam, match.awayTeam,
-                kickoffSA.format(DateTimeFormatter.ofPattern("HH:mm")));
-
-        if (now.isAfter(kickoffSA)) {
-            System.out.println("[MATCH] Kickoff already passed — skipping");
-            return;
-        }
-
-        if (now.isBefore(predictAt)) {
-            long sleepMins = Duration.between(now, predictAt).toMinutes();
-            System.out.printf("[MATCH] Sleeping %d min until %s SA%n",
-                    sleepMins,
-                    predictAt.format(DateTimeFormatter.ofPattern("HH:mm")));
-            sleepMinutes(sleepMins);
-        }
-
-        System.out.println("[MATCH] Prediction window — running prediction");
-        runPrediction(match);
-    }
-
-    // --------------------------------------------------------
-    // Full prediction for one match
-    // --------------------------------------------------------
-    private static void runPrediction(ScheduledMatch scheduledMatch) {
-        try {
-            // Load lineups now that we're in the window
-            JSONBootstrapHelper.loadCurrentGameweek();
-
-            // Load all data sources
-            FPLDataCache.initialize();
-            TheSportsDBClient.preload();
-            StandingsClient.preload();
-            OddsClient.preload();
-
-            // Get match from football-data.org
-            List<Integer> teamIds = new ArrayList<>();
-            teamIds.add(scheduledMatch.fplHomeId);
-            teamIds.add(scheduledMatch.fplAwayId);
-            List<Match> matches = FixtureFetcher.getMatchesForTeams(teamIds);
-
-            if (matches.isEmpty()) {
-                System.out.println("[PREDICT] Match not found in football-data.org");
-                return;
-            }
-
-            List<Prediction> finalPredictions = new ArrayList<>();
-            List<OddsBlender.BlendedProbabilities> blendedList = new ArrayList<>();
-
-            for (Match match : matches) {
-                System.out.println("==============================================");
-                System.out.println("  " + match.getHomeTeamName()
-                        + " vs " + match.getAwayTeamName());
-                System.out.println("==============================================");
-
+            try {
                 Team home = StatsCalculator.buildTeam(
                         match.getHomeTeamId(), match.getHomeTeamName());
                 Team away = StatsCalculator.buildTeam(
@@ -204,125 +142,114 @@ public class Main {
                 finalPredictions.add(finalPrediction);
                 blendedList.add(blended);
 
+                System.out.println();
+                System.out.println(finalPrediction);
                 System.out.printf("  Over 1.5: %.1f%%  2.5: %.1f%%  3.5: %.1f%%%n",
                         blended.over15Prob, blended.over25Prob, blended.over35Prob);
+                System.out.println();
+
+            } catch (Exception e) {
+                System.out.println("[ERROR] Failed to predict "
+                        + match + ": " + e.getMessage());
+                e.printStackTrace();
             }
-
-            if (!finalPredictions.isEmpty()) {
-                TelegramNotifier.sendPredictions(matches, finalPredictions, blendedList);
-                System.out.println("[PREDICT] Sent to Telegram");
-            }
-
-            // Reset FPL cache so next match gets fresh lineup data
-            FPLDataCache.reset();
-
-        } catch (Exception e) {
-            System.out.println("[PREDICT] Error: " + e.getMessage());
-            e.printStackTrace();
         }
-    }
 
-    // --------------------------------------------------------
-    // Sleep until tomorrow 8am SA time
-    // --------------------------------------------------------
-    private static void sleepUntilTomorrow() {
-        ZonedDateTime now      = ZonedDateTime.now(SA_ZONE);
-        ZonedDateTime tomorrow = now.toLocalDate()
-                .plusDays(1)
-                .atTime(WAKE_HOUR, 0)
-                .atZone(SA_ZONE);
-
-        long sleepMins = Duration.between(now, tomorrow).toMinutes();
-        System.out.printf("%n[SLEEP] Sleeping %d min until tomorrow %dam SA (%s)%n",
-                sleepMins, WAKE_HOUR,
-                tomorrow.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")));
-        sleepMinutes(sleepMins);
-    }
-
-    private static void sleepMinutes(long minutes) {
-        try {
-            if (minutes > 0) Thread.sleep(minutes * 60 * 1000L);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        if (!finalPredictions.isEmpty()) {
+            System.out.println("[TELEGRAM] Sending predictions...");
+            TelegramNotifier.sendPredictions(matches, finalPredictions, blendedList);
         }
+
+        EloStore.printStandings();
+
+        System.out.println("==============================================");
+        System.out.println("           Predictions complete");
+        System.out.println("==============================================");
     }
 
     // --------------------------------------------------------
-    // Parse today's fixtures with kickoff times from FPL
+    // Get teams with a match in WINDOW_MIN to WINDOW_MAX minutes
+    // Uses FPL fixtures directly — no extra API call needed
     // --------------------------------------------------------
-    private static List<ScheduledMatch> getTodayMatchesWithKickoffs(
-            JSONArray fixtures, Map<Integer, String> fplIdToName) {
-
-        List<ScheduledMatch> matches = new ArrayList<>();
-        LocalDate today = LocalDate.now(SA_ZONE);
+    private static List<Integer> getTeamsInWindow() {
+        org.json.JSONArray fixtures = FPLLineupClient.getAllFixtures();
+        List<Integer> teamIds = new ArrayList<>();
+        java.time.ZonedDateTime now =
+                java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC);
 
         for (int i = 0; i < fixtures.length(); i++) {
             try {
-                JSONObject fixture = fixtures.getJSONObject(i);
-                String kickoffStr  = fixture.optString("kickoff_time", null);
-                if (kickoffStr == null) continue;
+                org.json.JSONObject fixture = fixtures.getJSONObject(i);
+                if (fixture.optBoolean("started",  false)) continue;
                 if (fixture.optBoolean("finished", false)) continue;
 
-                ZonedDateTime kickoffUTC  = ZonedDateTime.parse(kickoffStr,
-                        DateTimeFormatter.ISO_DATE_TIME);
-                LocalDate kickoffDate = kickoffUTC
-                        .withZoneSameInstant(SA_ZONE).toLocalDate();
-                if (!kickoffDate.equals(today)) continue;
+                String kickoffStr = fixture.optString("kickoff_time", null);
+                if (kickoffStr == null) continue;
 
-                int homeId = fixture.optInt("team_h", -1);
-                int awayId = fixture.optInt("team_a", -1);
-                if (homeId < 0 || awayId < 0) continue;
+                java.time.ZonedDateTime kickoff = java.time.ZonedDateTime.parse(
+                        kickoffStr,
+                        java.time.format.DateTimeFormatter.ISO_DATE_TIME);
+                long minutesUntil =
+                        java.time.Duration.between(now, kickoff).toMinutes();
 
-                String homeName = fplIdToName.getOrDefault(homeId, "Team " + homeId);
-                String awayName = fplIdToName.getOrDefault(awayId, "Team " + awayId);
-
-                matches.add(new ScheduledMatch(
-                        homeId, awayId, homeName, awayName, kickoffUTC));
-
+                if (minutesUntil >= WINDOW_MIN && minutesUntil <= WINDOW_MAX) {
+                    int homeId = fixture.optInt("team_h", -1);
+                    int awayId = fixture.optInt("team_a", -1);
+                    if (homeId > 0) teamIds.add(homeId);
+                    if (awayId > 0) teamIds.add(awayId);
+                    System.out.printf("[WINDOW] Match in %d min — FPL teams %d vs %d%n",
+                            minutesUntil, homeId, awayId);
+                }
             } catch (Exception e) {
-                System.out.println("[DAILY] Fixture parse error: " + e.getMessage());
+                System.out.println("[WINDOW] Parse error: " + e.getMessage());
             }
         }
-        return matches;
+        return teamIds;
+    }
+
+    // --------------------------------------------------------
+    // Once-per-day throttle helpers
+    // --------------------------------------------------------
+    private static boolean alreadySentToday(String filePath, String todaySA) {
+        try {
+            File file = new File(filePath);
+            if (!file.exists()) return false;
+            try (BufferedReader r = new BufferedReader(new FileReader(file))) {
+                String last = r.readLine();
+                return todaySA.equals(last != null ? last.trim() : "");
+            }
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static void saveSentDate(String filePath, String todaySA) {
+        try {
+            new File("data").mkdirs();
+            try (FileWriter fw = new FileWriter(filePath)) {
+                fw.write(todaySA);
+            }
+        } catch (Exception e) {
+            System.out.println("[INIT] Could not save date file: " + e.getMessage());
+        }
     }
 
     // --------------------------------------------------------
     // Lightweight FPL ID -> name map
     // --------------------------------------------------------
-    private static Map<Integer, String> buildLightFplNameMap() {
-        Map<Integer, String> map = new HashMap<>();
+    private static java.util.Map<Integer, String> buildLightFplNameMap() {
+        java.util.Map<Integer, String> map = new java.util.HashMap<>();
         try {
-            JSONObject bootstrap = FPLClient.getBootstrapStatic();
+            org.json.JSONObject bootstrap = FPLClient.getBootstrapStatic();
             if (bootstrap == null) return map;
-            JSONArray teams = bootstrap.getJSONArray("teams");
+            org.json.JSONArray teams = bootstrap.getJSONArray("teams");
             for (int i = 0; i < teams.length(); i++) {
-                JSONObject team = teams.getJSONObject(i);
+                org.json.JSONObject team = teams.getJSONObject(i);
                 map.put(team.getInt("id"), team.getString("name"));
             }
         } catch (Exception e) {
             System.out.println("[INIT] FPL name map error: " + e.getMessage());
         }
         return map;
-    }
-
-    // --------------------------------------------------------
-    // Data class for a scheduled match
-    // --------------------------------------------------------
-    private static class ScheduledMatch {
-        final int           fplHomeId;
-        final int           fplAwayId;
-        final String        homeTeam;
-        final String        awayTeam;
-        final ZonedDateTime kickoffUTC;
-
-        ScheduledMatch(int fplHomeId, int fplAwayId,
-                       String homeTeam, String awayTeam,
-                       ZonedDateTime kickoffUTC) {
-            this.fplHomeId  = fplHomeId;
-            this.fplAwayId  = fplAwayId;
-            this.homeTeam   = homeTeam;
-            this.awayTeam   = awayTeam;
-            this.kickoffUTC = kickoffUTC;
-        }
     }
 }
