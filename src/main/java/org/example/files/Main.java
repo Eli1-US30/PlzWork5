@@ -6,6 +6,7 @@ import org.json.JSONObject;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -143,12 +144,18 @@ public class Main {
 
     // --------------------------------------------------------
     // Fetch only matches scheduled for tomorrow (SA date)
-    // Uses football-data.org upcoming fixtures
+    // Uses football-data.org date range filter — only fetches
+    // matches between today and day after tomorrow so we never
+    // pull the whole season
     // --------------------------------------------------------
     private static List<Match> getTomorrowsMatches(LocalDate tomorrow) {
         List<Match> tomorrowMatches = new ArrayList<>();
 
-        JSONArray fixtures = APIFootballClient.getUpcomingFixtures();
+        // Date range: today → day after tomorrow (catches any UTC timezone edge cases)
+        LocalDate from = tomorrow.minusDays(1); // today SA
+        LocalDate to   = tomorrow.plusDays(1);  // day after tomorrow
+
+        JSONArray fixtures = APIFootballClient.getFixturesForDateRange(from, to);
 
         for (int i = 0; i < fixtures.length(); i++) {
             try {
@@ -157,16 +164,7 @@ public class Main {
                 String dateStr = fixture.getString("utcDate").substring(0, 10);
                 LocalDate matchDate = LocalDate.parse(dateStr);
 
-                // Convert UTC date to SA date for accurate comparison
-                // Most PL games are afternoon/evening UTC so SA date is same
-                // but we check both UTC date and SA date to be safe
-                if (!matchDate.equals(tomorrow) &&
-                        !matchDate.equals(tomorrow.minusDays(1))) {
-                    // Skip if clearly not tomorrow
-                    if (!matchDate.equals(tomorrow)) continue;
-                }
-
-                // Only include if SA date matches tomorrow
+                // Only include matches on tomorrow's SA date
                 if (!matchDate.equals(tomorrow)) continue;
 
                 int fixtureId = fixture.getInt("id");

@@ -62,6 +62,32 @@ public class APIFootballClient {
     }
 
     /**
+     * Fetches scheduled PL matches between two dates (inclusive).
+     * Used by morning run to get only tomorrow's matches.
+     * football-data.org supports dateFrom and dateTo query params.
+     *
+     * @param from start date (inclusive)
+     * @param to   end date (inclusive)
+     */
+    public static JSONArray getFixturesForDateRange(LocalDate from, LocalDate to) {
+        try {
+            String endpoint = "competitions/" + PL_CODE
+                    + "/matches?status=SCHEDULED"
+                    + "&dateFrom=" + from.toString()
+                    + "&dateTo=" + to.toString();
+            JSONObject json = get(endpoint);
+            JSONArray matches = json.getJSONArray("matches");
+            System.out.println("[FIXTURES] Fetched " + matches.length()
+                    + " match(es) between " + from + " and " + to);
+            return matches;
+        } catch (Exception e) {
+            System.out.println("[WARN] Could not fetch fixtures for date range: "
+                    + e.getMessage());
+            return new JSONArray();
+        }
+    }
+
+    /**
      * Fetches last 5 finished matches for a team across ALL competitions.
      * Using limit=5 with no competition filter so Europa, FA Cup etc are included.
      * This is important for fatigue calculation — a Thursday Europa game
