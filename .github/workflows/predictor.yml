@@ -1,15 +1,11 @@
 name: Soccer Predictor
 
 on:
-  # Run every hour, every day, 7am-9pm UTC (9am-11pm SA time)
-  # The code itself decides what to do:
-  #   - No games today       → sends "no games" notification, exits
-  #   - Games today but not in window → sends "games today" list, exits
-  #   - Match in 25-90 minutes → full prediction run
-  # Empty runs cost one FPL API call (free, no rate limit)
+  # Runs once every morning at 6am UTC = 8am SA time
+  # Predicts ALL upcoming PL matches in the next 7 days
+  # One clean reliable run per day — no timing gaps, no missed games
   schedule:
-    # Better — every 30 minutes (doubles the chances of catching the window)
-    - cron: '0,30 7-19 * * *'
+    - cron: '0 6 * * *'
 
   # Manual trigger for testing
   workflow_dispatch:
