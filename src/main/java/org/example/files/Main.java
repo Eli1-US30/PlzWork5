@@ -6,6 +6,7 @@ import org.json.JSONObject;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.time.ZonedDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
@@ -58,6 +59,8 @@ public class Main {
 
         if (matches.isEmpty()) {
             System.out.println("[INIT] No matches tomorrow — exiting silently");
+            // Uncomment below to get a Telegram message when no games found:
+            // TelegramNotifier.sendNoGamesToday();
             System.out.println("==============================================");
             return;
         }
@@ -143,29 +146,41 @@ public class Main {
     }
 
     // --------------------------------------------------------
-    // Fetch only matches scheduled for tomorrow (SA date)
-    // Uses football-data.org date range filter — only fetches
-    // matches between today and day after tomorrow so we never
-    // pull the whole season
+    // Fetch only matches scheduled for tomorrow (SA date).
+    // Converts UTC kickoff time to SA time before comparing
+    // dates — fixes the bug where matches were skipped because
+    // a Saturday 3pm UTC match has UTC date Saturday but
+    // SA date is also Saturday, and we want tomorrow in SA time.
     // --------------------------------------------------------
     private static List<Match> getTomorrowsMatches(LocalDate tomorrow) {
         List<Match> tomorrowMatches = new ArrayList<>();
 
-        // Date range: today → day after tomorrow (catches any UTC timezone edge cases)
-        LocalDate from = tomorrow.minusDays(1); // today SA
-        LocalDate to   = tomorrow.plusDays(1);  // day after tomorrow
+        // Wide date range so we never miss a match due to UTC/SA edge cases
+        // API call is cheap — we filter properly below
+        LocalDate from = tomorrow.minusDays(1);
+        LocalDate to   = tomorrow.plusDays(1);
 
         JSONArray fixtures = APIFootballClient.getFixturesForDateRange(from, to);
+        System.out.printf("[INIT] API returned %d fixture(s) in date range%n",
+                fixtures.length());
 
         for (int i = 0; i < fixtures.length(); i++) {
             try {
                 JSONObject fixture = fixtures.getJSONObject(i);
 
-                String dateStr = fixture.getString("utcDate").substring(0, 10);
-                LocalDate matchDate = LocalDate.parse(dateStr);
+                // Get the full UTC kickoff datetime and convert to SA date
+                String utcDateStr = fixture.getString("utcDate");
+                ZonedDateTime kickoffUTC = ZonedDateTime.parse(utcDateStr,
+                        java.time.format.DateTimeFormatter.ISO_DATE_TIME);
+                LocalDate matchDateSA = kickoffUTC
+                        .withZoneSameInstant(SA_ZONE)
+                        .toLocalDate();
+
+                System.out.printf("[FIXTURE-CHECK] UTC=%s → SA date=%s (tomorrow=%s)%n",
+                        utcDateStr.substring(0, 16), matchDateSA, tomorrow);
 
                 // Only include matches on tomorrow's SA date
-                if (!matchDate.equals(tomorrow)) continue;
+                if (!matchDateSA.equals(tomorrow)) continue;
 
                 int fixtureId = fixture.getInt("id");
                 JSONObject home = fixture.getJSONObject("homeTeam");
@@ -179,8 +194,8 @@ public class Main {
                 tomorrowMatches.add(
                         new Match(fixtureId, homeId, homeName, awayId, awayName));
 
-                System.out.printf("[FIXTURE] %s vs %s on %s%n",
-                        homeName, awayName, matchDate);
+                System.out.printf("[FIXTURE] ✅ %s vs %s on %s SA%n",
+                        homeName, awayName, matchDateSA);
 
             } catch (Exception e) {
                 System.out.println("[WARN] Could not parse fixture: "

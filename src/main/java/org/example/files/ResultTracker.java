@@ -84,9 +84,23 @@ public class ResultTracker {
                     String predictedOutcome = row[9].replace("\"", "").trim();
                     String actualOutcome    = getOutcome(homeName, awayName,
                             actualHome, actualAway);
-                    boolean correct = predictedOutcome.equalsIgnoreCase(actualOutcome);
+
+                    // 3 levels of correctness:
+                    // EXACT   — predicted outcome AND score both correct
+                    // OUTCOME — predicted outcome correct, score wrong
+                    // WRONG   — predicted outcome wrong
+                    int predH = Integer.parseInt(row[4].trim());
+                    int predA = Integer.parseInt(row[5].trim());
+                    boolean outcomeCorrect = predictedOutcome.equalsIgnoreCase(actualOutcome);
+                    boolean scoreCorrect   = outcomeCorrect
+                            && predH == actualHome && predA == actualAway;
+                    boolean correct = outcomeCorrect; // for accuracy stats
                     boolean blowout = !correct
                             && Math.abs(actualHome - actualAway) >= BLOWOUT_MARGIN;
+
+                    String correctnessLevel = scoreCorrect  ? "EXACT"
+                            : outcomeCorrect                ? "OUTCOME"
+                            : "WRONG";
 
                     // Update ELO
                     EloStore.recordResult(homeName, awayName, actualHome, actualAway);
@@ -100,22 +114,23 @@ public class ResultTracker {
 
                     // Send Telegram result notification
                     try {
-                        int predHomeGoals = Integer.parseInt(row[4].trim());
-                        int predAwayGoals = Integer.parseInt(row[5].trim());
                         TelegramNotifier.sendResult(
                                 homeName, awayName,
                                 actualHome, actualAway,
                                 predictedOutcome,
-                                predHomeGoals, predAwayGoals);
+                                predH, predA,
+                                correctnessLevel);
                     } catch (Exception e) {
                         System.out.println("[RESULTS] Could not send Telegram result: "
                                 + e.getMessage());
                     }
 
                     String blowoutTag = blowout ? " 🌪️ BLOWOUT" : "";
+                    String resultIcon = scoreCorrect ? "✅ EXACT"
+                            : outcomeCorrect ? "🎯 OUTCOME" : "❌ WRONG";
                     System.out.printf("[RESULTS] %s %d-%d %s (predicted: %s, %s%s)%n",
                             homeName, actualHome, actualAway, awayName,
-                            predictedOutcome, correct ? "✅" : "❌", blowoutTag);
+                            predictedOutcome, resultIcon, blowoutTag);
 
                     updated++;
                     break;
@@ -293,7 +308,11 @@ public class ResultTracker {
                                 row[2].replace("\"", ""),
                                 row[3].replace("\"", ""),
                                 ah, aa);
-                        correct = predicted.equalsIgnoreCase(actual) ? "TRUE" : "FALSE";
+                        boolean outCor = predicted.equalsIgnoreCase(actual);
+                        boolean scoCor = outCor
+                                && safe(row,4).equals(String.valueOf(ah))
+                                && safe(row,5).equals(String.valueOf(aa));
+                        correct = scoCor ? "EXACT" : outCor ? "OUTCOME" : "FALSE";
                     } catch (Exception ignored) {}
                 }
 

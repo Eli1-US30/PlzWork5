@@ -145,17 +145,31 @@ public class TelegramNotifier {
     public static void sendResult(String homeTeam, String awayTeam,
                                   int actualHome, int actualAway,
                                   String predictedOutcome,
-                                  int predictedHome, int predictedAway) {
+                                  int predictedHome, int predictedAway,
+                                  String correctnessLevel) {
 
         String actualOutcome = actualHome > actualAway
                 ? homeTeam + " Win"
                 : actualAway > actualHome ? awayTeam + " Win" : "Draw";
 
-        boolean correct  = predictedOutcome.equalsIgnoreCase(actualOutcome);
-        int     margin   = Math.abs(actualHome - actualAway);
-        boolean blowout  = !correct && margin >= BLOWOUT_MARGIN;
+        boolean outcomeCorrect = predictedOutcome.equalsIgnoreCase(actualOutcome);
+        int     margin         = Math.abs(actualHome - actualAway);
+        boolean blowout        = !outcomeCorrect && margin >= BLOWOUT_MARGIN;
 
-        String icon = correct ? "✅" : (blowout ? "🌪️" : "❌");
+        // 3 levels of correctness
+        // EXACT   = ✅ predicted score AND outcome both right
+        // OUTCOME = 🎯 predicted outcome right, score wrong
+        // WRONG   = ❌ predicted outcome wrong
+        String icon;
+        String label;
+        switch (correctnessLevel) {
+            case "EXACT"   -> { icon = "✅"; label = "CORRECT — exact score!"; }
+            case "OUTCOME" -> { icon = "🎯"; label = "CORRECT — right outcome, wrong score"; }
+            default        -> { icon = blowout ? "🌪️" : "❌";
+                label = blowout
+                        ? "INCORRECT — blowout (margin " + margin + ")"
+                        : "INCORRECT"; }
+        }
 
         StringBuilder sb = new StringBuilder();
         sb.append("🏁 *Match Result*\n\n");
@@ -172,15 +186,7 @@ public class TelegramNotifier {
 
         sb.append("Result:       *").append(escapeMarkdown(actualOutcome)).append("*\n");
         sb.append("We predicted: *").append(escapeMarkdown(predictedOutcome)).append("*\n\n");
-        sb.append(icon).append(" *")
-                .append(correct ? "CORRECT" : "INCORRECT").append("*");
-
-        // Blowout explanation
-        if (blowout) {
-            sb.append("\n_").append(escapeMarkdown(
-                            "Blowout result (margin " + margin + ") — unpredictable"))
-                    .append("_");
-        }
+        sb.append(icon).append(" *").append(escapeMarkdown(label)).append("*");
 
         send(sb.toString());
     }
